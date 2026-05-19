@@ -289,7 +289,14 @@ def run_conversation(
         agent._turns_since_memory += 1
         if agent._turns_since_memory >= agent._memory_nudge_interval:
             _should_review_memory = True
+            _turns_since_at_trigger = agent._turns_since_memory
             agent._turns_since_memory = 0
+            # -- Instrumentation: nudge trigger --
+            if getattr(agent, '_instrumentation_enabled', False):
+                try:
+                    agent._emit_nudge_trigger(turns_since_last=_turns_since_at_trigger)
+                except Exception:
+                    pass
 
     # Add user message
     user_msg = {"role": "user", "content": user_message}
@@ -512,6 +519,13 @@ def run_conversation(
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             _ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+        except Exception:
+            pass
+
+    # -- Memory instrumentation: context_construction (pre-API-call snapshot) --
+    if getattr(agent, '_instrumentation_enabled', False):
+        try:
+            agent._emit_context_construction(_ext_prefetch_cache)
         except Exception:
             pass
 
@@ -3896,6 +3910,36 @@ def run_conversation(
             )
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
+
+    # -- Memory instrumentation: influence self-assessment (post-response) --
+    if getattr(agent, '_instrumentation_enabled', False):
+        if final_response and not interrupted:
+            try:
+                agent._emit_influence_assessment(final_response)
+            except Exception as _instr_exc:
+                logger.debug(
+                    "instrumentation: influence_assessment caller-side failed at turn %s: %s",
+                    getattr(agent, '_user_turn_count', '?'), _instr_exc,
+                )
+        else:
+            # Log gate misses so analysts can distinguish "no record because
+            # gate excluded" from "no record because emit raised silently".
+            logger.debug(
+                "instrumentation: influence_assessment skipped at turn %s "
+                "(final_response=%s, interrupted=%s)",
+                getattr(agent, '_user_turn_count', '?'),
+                bool(final_response), bool(interrupted),
+            )
+
+    # -- Memory instrumentation: periodic_synthesis every 20 turns --
+    if getattr(agent, '_instrumentation_enabled', False):
+        try:
+            _turn = getattr(agent, '_user_turn_count', 0) or 0
+            _last = getattr(agent, '_instr_last_synthesis_turn', 0) or 0
+            if _turn > 0 and _turn % 20 == 0 and _turn != _last:
+                agent._emit_periodic_synthesis(reason="turn_cadence_20")
+        except Exception:
+            pass
 
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything

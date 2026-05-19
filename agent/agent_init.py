@@ -950,6 +950,52 @@ def init_agent(
                 agent._memory_store.load_from_disk()
         except Exception:
             pass  # Memory is optional -- don't break agent init
+
+    # -- Memory instrumentation config --
+    agent._instrumentation_enabled = False
+    agent._instr_session_start_entry_ids = []  # captured below when enabled
+    agent._instr_last_synthesis_turn = 0
+    agent._instr_background_review_count = 0
+    agent._instr_compression_pending = False
+    agent._instr_inline_llm_assessment = False
+    agent._instr_background_influence_assessment = False
+    agent._instr_assessment_timeout_seconds = 5.0
+    agent._instr_precedence_logged = False
+    if not skip_memory:
+        try:
+            _mem_cfg = _agent_cfg.get("memory", {})
+            instr_cfg = _mem_cfg.get("instrumentation", {}) if isinstance(_mem_cfg, dict) else {}
+            agent._instrumentation_enabled = instr_cfg.get("enabled", False)
+            agent._instr_inline_llm_assessment = bool(
+                instr_cfg.get("inline_llm_assessment", False)
+            )
+            agent._instr_background_influence_assessment = bool(
+                instr_cfg.get("background_influence_assessment", False)
+            )
+            try:
+                agent._instr_assessment_timeout_seconds = float(
+                    instr_cfg.get("assessment_timeout_seconds", 5.0)
+                )
+            except (TypeError, ValueError):
+                agent._instr_assessment_timeout_seconds = 5.0
+            agent._instrumentation_session_id = agent.session_id
+            agent._instrumentation_source = "foreground"
+            if agent._instrumentation_enabled:
+                try:
+                    from agent.memory_instrumentation import compute_entry_id
+                    if agent._memory_store and agent._memory_store.memory_entries:
+                        agent._instr_session_start_entry_ids = [
+                            compute_entry_id(e) for e in list(agent._memory_store.memory_entries)
+                        ]
+                    import logging as _lg
+                    _lg.getLogger("agent.memory_instrumentation").info(
+                        "Memory instrumentation enabled — reports → ~/.hermes2/instrumentation/memory/%s.ndjson",
+                        agent.session_id,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
     
 
 

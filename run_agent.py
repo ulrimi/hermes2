@@ -1920,6 +1920,17 @@ class AIAgent:
                 )
             except Exception:
                 pass
+        # -- Memory instrumentation: final periodic_synthesis at session end --
+        if getattr(self, "_instrumentation_enabled", False):
+            try:
+                self._emit_periodic_synthesis(reason="session_end")
+            except Exception:
+                pass
+            try:
+                from agent.memory_instrumentation import reset_session_counters
+                reset_session_counters(self.session_id or "")
+            except Exception:
+                pass
 
     def commit_memory_session(self, messages: list = None) -> None:
         """Trigger end-of-session extraction without tearing providers down.
@@ -1994,6 +2005,398 @@ class AIAgent:
             )
         except Exception:
             pass
+
+    # -- Memory instrumentation methods (fire-and-forget, never raise) -------
+
+    def _emit_context_construction(self, ext_prefetch_cache: str = "") -> None:
+        """Emit context_construction instrumentation report for this turn.
+
+        Failures are logged at DEBUG (not silently swallowed) so analysts can
+        diagnose missing records via `--log-level DEBUG` or grep on the log.
+        """
+        try:
+            from agent.memory_instrumentation import (
+                compute_entry_id, emit_report, build_context_construction_report
+            )
+            entries = []
+            live_entries = list(self._memory_store.memory_entries) if self._memory_store else []
+            for entry in live_entries:
+                entries.append({
+                    "entry_id": compute_entry_id(entry),
+                    "first_80_chars": entry[:80] + ("..." if len(entry) > 80 else "")
+                })
+            snapshot_chars = self._memory_store._char_count("memory") if self._memory_store else 0
+            limit = self._memory_store._char_limit("memory") if self._memory_store else 2200
+            pct = min(100, (snapshot_chars / limit) * 100) if limit > 0 else 0
+
+            snapshot_rendered = bool(
+                self._memory_store
+                and self._memory_store.format_for_system_prompt("memory")
+            )
+            compression_this_turn = bool(getattr(self, "_instr_compression_pending", False))
+            # Consume the flag — only the first emit after compression should claim it.
+            self._instr_compression_pending = False
+
+            report = build_context_construction_report(
+                session_id=self.session_id,
+                turn_number=getattr(self, '_user_turn_count', 0),
+                iteration_number=0,
+                frozen_snapshot_included=snapshot_rendered,
+                frozen_snapshot_size_chars=snapshot_chars,
+                frozen_snapshot_size_pct=pct,
+                memory_entries=entries,
+                memory_entries_count=len(entries),
+                user_entries_count=len(self._memory_store.user_entries) if self._memory_store else 0,
+                external_prefetch_active=bool(self._memory_manager),
+                external_prefetch_content_length=len(ext_prefetch_cache) if ext_prefetch_cache else 0,
+                compression_active_this_turn=compression_this_turn,
+                compression_count_this_session=getattr(getattr(self, 'context_compressor', None), 'compression_count', 0),
+            )
+            emit_report(report, self.session_id)
+        except Exception as _instr_exc:
+            logger.debug(
+                "instrumentation: context_construction emit failed at turn %s: %s",
+                getattr(self, '_user_turn_count', '?'), _instr_exc,
+            )
+
+    def _emit_influence_assessment(self, final_response: str) -> None:
+        """Dispatch memory_influence_self_assessment emission for this turn.
+
+        Three paths, in precedence order:
+
+        1. Background aux assessment (Story 003) when
+           ``_instr_background_influence_assessment`` is on — daemon thread,
+           zero foreground latency, ``assessment_method='output_inference'``.
+        2. Inline aux assessment (Story 002) when
+           ``_instr_inline_llm_assessment`` is on — synchronous aux call on
+           this thread, ``assessment_method='output_inference'``.
+        3. Heuristic (Story 001) — always falls through here; substring-based
+           per-entry tagging with ``assessment_method='pattern_matching'``.
+
+        When both background and inline flags are on, background wins and a
+        one-time INFO log records the precedence decision for the session.
+        Any failure in 1 or 2 falls back to a per-path error_fallback report;
+        catastrophic failure in 3 logs at DEBUG and emits nothing (matches
+        prior fire-and-forget contract).
+        """
+        try:
+            from agent.memory_instrumentation import compute_entry_id
+
+            live_entries = list(self._memory_store.memory_entries) if self._memory_store else []
+            entry_ids = [compute_entry_id(e) for e in live_entries]
+            memory_block_visible = bool(
+                self._memory_store
+                and self._memory_store.format_for_system_prompt("memory")
+            )
+
+            bg_on = bool(getattr(self, "_instr_background_influence_assessment", False))
+            inline_on = bool(getattr(self, "_instr_inline_llm_assessment", False))
+
+            if bg_on and inline_on and not getattr(self, "_instr_precedence_logged", False):
+                logger.info(
+                    "memory.instrumentation: both background_influence_assessment and "
+                    "inline_llm_assessment are enabled; background path takes precedence"
+                )
+                self._instr_precedence_logged = True
+
+            if bg_on:
+                self._emit_influence_assessment_background(
+                    final_response=final_response,
+                    entries_snapshot=live_entries,
+                    entry_ids_snapshot=entry_ids,
+                    memory_block_visible=memory_block_visible,
+                )
+                return
+
+            if inline_on:
+                self._emit_influence_assessment_inline(
+                    final_response=final_response,
+                    entries_snapshot=live_entries,
+                    entry_ids_snapshot=entry_ids,
+                    memory_block_visible=memory_block_visible,
+                )
+                return
+
+            self._emit_influence_assessment_heuristic(
+                final_response=final_response,
+                live_entries=live_entries,
+                entry_ids=entry_ids,
+                memory_block_visible=memory_block_visible,
+            )
+        except Exception as _instr_exc:
+            logger.debug(
+                "instrumentation: influence_assessment dispatch failed at turn %s: %s",
+                getattr(self, '_user_turn_count', '?'), _instr_exc,
+            )
+
+    def _emit_influence_assessment_heuristic(
+        self,
+        *,
+        final_response: str,
+        live_entries: list,
+        entry_ids: list,
+        memory_block_visible: bool,
+    ) -> None:
+        """Story 001 path: 40-char substring heuristic, pattern_matching method."""
+        try:
+            from agent.memory_instrumentation import (
+                emit_report, build_influence_self_assessment_report
+            )
+
+            response_lower = final_response.lower()
+            entries_unused: list = []
+            entries_cited: list = []
+            for i, entry in enumerate(live_entries):
+                eid = entry_ids[i]
+                cited = entry[:40].lower() in response_lower if len(entry) > 20 else False
+                first_80 = entry[:80] + ("..." if len(entry) > 80 else "")
+                if cited:
+                    entries_cited.append({
+                        "entry_id": eid,
+                        "first_80_chars": first_80,
+                        "influence_assessment": "cited",
+                        "confidence": "low",
+                        "method": "pattern_matching",
+                        "reasoning": "Substring of entry appeared in response (40-char prefix match heuristic)"
+                    })
+                else:
+                    entries_unused.append({
+                        "entry_id": eid,
+                        "first_80_chars": first_80,
+                        "influence_assessment": "unused_per_heuristic",
+                        "confidence": "low",
+                        "method": "pattern_matching",
+                        "reasoning": "40-char prefix did not appear verbatim in response; subliminal/paraphrased influence not detectable"
+                    })
+
+            if not live_entries:
+                overall_utility = "n_a_no_entries"
+            elif entries_cited:
+                overall_utility = "some_heuristic_evidence"
+            else:
+                overall_utility = "no_heuristic_evidence"
+
+            reasoning = (
+                f"Heuristic-derived overall: {len(entries_cited)} of {len(live_entries)} "
+                "entries had a 40-char prefix appear in the response. Method remains "
+                "pattern_matching; subliminal and paraphrased influence undetected. "
+                "Analysts: filter on overall_confidence=='low' to exclude from "
+                "high-fidelity utility analyses."
+            )
+
+            report = build_influence_self_assessment_report(
+                session_id=self.session_id,
+                turn_number=getattr(self, '_user_turn_count', 0),
+                response_length_chars=len(final_response),
+                memory_entries_at_response_time=entry_ids,
+                memory_entries_count=len(entry_ids),
+                memory_block_visible=memory_block_visible,
+                entries_explicitly_cited=entries_cited,
+                entries_likely_influenced=[],
+                entries_present_but_unused=entries_unused,
+                entries_missing=[],
+                overall_utility=overall_utility,
+                overall_confidence="low",
+                assessment_method="pattern_matching",
+                reasoning=reasoning,
+            )
+            emit_report(report, self.session_id)
+        except Exception as _instr_exc:
+            logger.debug(
+                "instrumentation: heuristic influence emit failed at turn %s: %s",
+                getattr(self, '_user_turn_count', '?'), _instr_exc,
+            )
+
+    def _emit_influence_assessment_inline(
+        self,
+        *,
+        final_response: str,
+        entries_snapshot: list,
+        entry_ids_snapshot: list,
+        memory_block_visible: bool,
+    ) -> None:
+        """Story 002 path: synchronous aux LLM call, output_inference method."""
+        try:
+            from agent.influence_assessment import assess_influence_inline
+            from agent.memory_instrumentation import (
+                emit_report, build_influence_self_assessment_report
+            )
+
+            timeout = float(getattr(self, "_instr_assessment_timeout_seconds", 5.0))
+            parsed, err = assess_influence_inline(
+                entries=entries_snapshot,
+                entry_ids=entry_ids_snapshot,
+                response=final_response,
+                timeout_seconds=timeout,
+            )
+
+            if parsed is None:
+                report = build_influence_self_assessment_report(
+                    session_id=self.session_id,
+                    turn_number=getattr(self, '_user_turn_count', 0),
+                    response_length_chars=len(final_response),
+                    memory_entries_at_response_time=entry_ids_snapshot,
+                    memory_entries_count=len(entry_ids_snapshot),
+                    memory_block_visible=memory_block_visible,
+                    entries_explicitly_cited=[],
+                    entries_likely_influenced=[],
+                    entries_present_but_unused=[],
+                    entries_missing=[],
+                    overall_utility="unassessed",
+                    overall_confidence="low",
+                    assessment_method="error_fallback",
+                    reasoning=f"Inline aux assessment failed: {err}",
+                )
+            else:
+                report = build_influence_self_assessment_report(
+                    session_id=self.session_id,
+                    turn_number=getattr(self, '_user_turn_count', 0),
+                    response_length_chars=len(final_response),
+                    memory_entries_at_response_time=entry_ids_snapshot,
+                    memory_entries_count=len(entry_ids_snapshot),
+                    memory_block_visible=memory_block_visible,
+                    entries_explicitly_cited=parsed["entries_explicitly_cited"],
+                    entries_likely_influenced=parsed["entries_likely_influenced"],
+                    entries_present_but_unused=parsed["entries_present_but_unused"],
+                    entries_missing=[],
+                    overall_utility=parsed["overall_utility"],
+                    overall_confidence="medium",
+                    assessment_method="output_inference",
+                    reasoning=(
+                        parsed.get("overall_reasoning")
+                        or "Aux LLM assessed per-entry influence; see entries lists for details"
+                    ),
+                )
+
+            emit_report(report, self.session_id)
+        except Exception as _instr_exc:
+            logger.debug(
+                "instrumentation: inline influence emit failed at turn %s: %s",
+                getattr(self, '_user_turn_count', '?'), _instr_exc,
+            )
+
+    def _emit_influence_assessment_background(
+        self,
+        *,
+        final_response: str,
+        entries_snapshot: list,
+        entry_ids_snapshot: list,
+        memory_block_visible: bool,
+    ) -> None:
+        """Story 003 path: daemon thread, output_inference method, no foreground latency."""
+        try:
+            from agent.influence_assessment import spawn_influence_assessment_thread
+
+            spawn_influence_assessment_thread(
+                agent=self,
+                final_response=final_response,
+                entries_snapshot=entries_snapshot,
+                entry_ids_snapshot=entry_ids_snapshot,
+                turn_number=getattr(self, '_user_turn_count', 0),
+                session_id=self.session_id,
+                timeout_seconds=float(getattr(self, "_instr_assessment_timeout_seconds", 5.0)),
+                memory_block_visible=memory_block_visible,
+            )
+        except Exception as _instr_exc:
+            logger.debug(
+                "instrumentation: background influence spawn failed at turn %s: %s",
+                getattr(self, '_user_turn_count', '?'), _instr_exc,
+            )
+
+    def _emit_nudge_trigger(self, turns_since_last: int = None) -> None:
+        """Emit memory_nudge_trigger report when the periodic nudge fires.
+
+        ``turns_since_last`` is the value of ``_turns_since_memory`` at the moment
+        the threshold was crossed (i.e. before the reset). Caller passes it
+        because the counter has typically been reset before we emit.
+        """
+        try:
+            from agent.memory_instrumentation import (
+                emit_report, build_nudge_trigger_report
+            )
+            actual_turns_since = (
+                turns_since_last
+                if turns_since_last is not None
+                else self._memory_nudge_interval
+            )
+            report = build_nudge_trigger_report(
+                session_id=self.session_id,
+                turn_number=getattr(self, '_user_turn_count', 0),
+                turns_since_last_memory=actual_turns_since,
+                nudge_interval=self._memory_nudge_interval,
+                background_review_spawned=False,  # set True after spawn confirmed
+                co_triggered_with_skills=False,
+                should_probably_store=False,
+                confidence="low",
+                reasoning_method="pattern_matching",
+                reasoning=(
+                    "Placeholder Category B: nudge fired by turn cadence only; "
+                    "no live introspection on whether storage is warranted."
+                ),
+            )
+            emit_report(report, self.session_id)
+        except Exception as _instr_exc:
+            logger.debug(
+                "instrumentation: nudge_trigger emit failed at turn %s: %s",
+                getattr(self, '_user_turn_count', '?'), _instr_exc,
+            )
+
+    def _emit_periodic_synthesis(self, reason: str = "turn_cadence") -> None:
+        """Emit periodic_synthesis aggregating counters every 20 turns or at session end.
+
+        Skips emission if no turns have passed since the last synthesis — e.g.,
+        session ends at turn 20 right after the cadence-triggered synthesis fired.
+        """
+        try:
+            from agent.memory_instrumentation import (
+                compute_entry_id, emit_report, build_periodic_synthesis_report,
+                get_session_counters,
+            )
+            counters = get_session_counters(self.session_id)
+            current_turn = getattr(self, "_user_turn_count", 0)
+            last_synth = getattr(self, "_instr_last_synthesis_turn", 0)
+            if current_turn <= last_synth:
+                return  # no new turns to summarize; skip duplicate
+            self._instr_last_synthesis_turn = current_turn
+            turns_covered = f"{last_synth + 1}-{current_turn}" if current_turn > last_synth else f"{current_turn}"
+
+            entries = []
+            if self._memory_store and self._memory_store.memory_entries:
+                entries = [compute_entry_id(e) for e in list(self._memory_store.memory_entries)]
+            limit = self._memory_store._char_limit("memory") if self._memory_store else 2200
+            chars = self._memory_store._char_count("memory") if self._memory_store else 0
+            pct = min(100, int((chars / limit) * 100)) if limit > 0 else 0
+
+            report = build_periodic_synthesis_report(
+                session_id=self.session_id,
+                turns_covered=turns_covered,
+                total_memory_writes_foreground=counters.get("fg_writes", 0),
+                total_memory_writes_background=counters.get("bg_writes", 0),
+                total_memory_writes_blocked=counters.get("writes_blocked", 0),
+                total_turns=current_turn,
+                compression_events=getattr(getattr(self, "context_compressor", None), "compression_count", 0),
+                snapshot_reloads=counters.get("snapshot_reloads", 0),
+                nudge_events=counters.get("nudge_events", 0),
+                background_review_completions=counters.get("background_review_completions", 0),
+                current_memory_entries=entries,
+                current_usage_pct=f"{pct}%",
+                current_usage_chars=f"{chars:,}/{limit:,} chars",
+                patterns_observed=[],
+                questions_raised=[],
+                gaps_identified=[],
+                surprises=[],
+                confidence="low",
+                reasoning=(
+                    f"Placeholder Category B: aggregated counters only (trigger={reason}); "
+                    "no live cross-turn pattern reflection performed."
+                ),
+            )
+            emit_report(report, self.session_id)
+        except Exception as _instr_exc:
+            logger.debug(
+                "instrumentation: periodic_synthesis emit failed at turn %s (reason=%s): %s",
+                getattr(self, '_user_turn_count', '?'), reason, _instr_exc,
+            )
 
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
