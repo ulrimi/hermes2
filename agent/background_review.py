@@ -216,6 +216,98 @@ _COMBINED_REVIEW_PROMPT = (
 
 
 
+def extract_review_memory_writes(
+    review_messages: List[Dict],
+    prior_snapshot: List[Dict],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Walk review_messages and extract memory writes performed + blocked.
+
+    Returns ``{"writes_performed": [...], "writes_blocked": [...]}`` where each
+    entry is ``{"action", "target", "entry_id", "first_80_chars", "block_reason"?}``.
+    Tool messages already present in ``prior_snapshot`` (inherited history) are
+    skipped to avoid surfacing prior-turn actions as if they just happened.
+    """
+    try:
+        from agent.memory_instrumentation import compute_entry_id
+    except Exception:
+        def compute_entry_id(c):  # type: ignore
+            return "sha256:unknown"
+
+    existing_tool_call_ids = set()
+    existing_tool_contents = set()
+    for prior in prior_snapshot or []:
+        if not isinstance(prior, dict) or prior.get("role") != "tool":
+            continue
+        tcid = prior.get("tool_call_id")
+        if tcid:
+            existing_tool_call_ids.add(tcid)
+        else:
+            c = prior.get("content")
+            if isinstance(c, str):
+                existing_tool_contents.add(c)
+
+    # Map tool_call_id -> originating assistant tool_call args (for action/target/content)
+    pending_calls: Dict[str, Dict[str, Any]] = {}
+    for msg in review_messages or []:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                if fn.get("name") != "memory":
+                    continue
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                tcid = tc.get("id")
+                if tcid:
+                    pending_calls[tcid] = args
+
+    performed: List[Dict[str, Any]] = []
+    blocked: List[Dict[str, Any]] = []
+    for msg in review_messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        tcid = msg.get("tool_call_id")
+        if tcid and tcid in existing_tool_call_ids:
+            continue
+        if not tcid:
+            cstr = msg.get("content")
+            if isinstance(cstr, str) and cstr in existing_tool_contents:
+                continue
+        try:
+            data = json.loads(msg.get("content", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        args = pending_calls.get(tcid or "", {})
+        action = args.get("action")
+        target = args.get("target", "memory")
+        # Only count memory tool calls
+        if action not in {"add", "replace", "remove"}:
+            continue
+        if data.get("success"):
+            content = (args.get("content") or args.get("old_text") or "")
+            performed.append({
+                "action": action,
+                "target": target,
+                "entry_id": compute_entry_id(content) if content else "sha256:unknown",
+                "first_80_chars": content[:80] + ("..." if len(content) > 80 else ""),
+            })
+        else:
+            err = data.get("error", "")
+            if err:
+                blocked.append({
+                    "action": action,
+                    "target": target,
+                    "block_reason": err,
+                    "first_80_chars": (args.get("content") or args.get("old_text") or "")[:80],
+                })
+    return {"writes_performed": performed, "writes_blocked": blocked}
+
+
 def summarize_background_review_actions(
     review_messages: List[Dict],
     prior_snapshot: List[Dict],
@@ -398,6 +490,11 @@ def _run_review_in_thread(
             review_agent._user_profile_enabled = agent._user_profile_enabled
             review_agent._memory_nudge_interval = 0
             review_agent._skill_nudge_interval = 0
+            # -- Instrumentation: inherit from parent agent --
+            if getattr(agent, '_instrumentation_enabled', False):
+                review_agent._instrumentation_enabled = True
+                review_agent._instrumentation_session_id = agent.session_id
+                review_agent._instrumentation_source = "background_review"
             # Suppress all status/warning emits from the fork so the
             # user only sees the final successful-action summary.
             # Without this, mid-review "Iteration budget exhausted",
@@ -473,6 +570,9 @@ def _run_review_in_thread(
             except Exception:
                 pass
             review_messages = list(getattr(review_agent, "_session_messages", []))
+            _budget = getattr(review_agent, "iteration_budget", None)
+            _review_iterations = getattr(_budget, "used", None) if _budget else None
+            _review_agent_session_id = getattr(review_agent, "session_id", None) or agent.session_id
             review_agent = None
 
         # Scan the review agent's messages for successful tool actions
@@ -485,6 +585,41 @@ def _run_review_in_thread(
             review_messages,
             messages_snapshot,
         )
+
+        # -- Instrumentation: emit background_review_complete --
+        if getattr(agent, "_instrumentation_enabled", False):
+            try:
+                from agent.memory_instrumentation import (
+                    emit_report, build_background_review_complete_report,
+                )
+                _writes = extract_review_memory_writes(review_messages, messages_snapshot)
+                _bg_count = getattr(agent, "_instr_background_review_count", 0) + 1
+                agent._instr_background_review_count = _bg_count
+                report = build_background_review_complete_report(
+                    session_id=agent.session_id,
+                    turn_number=getattr(agent, "_user_turn_count", 0),
+                    review_agent_session_id=_review_agent_session_id,
+                    review_messages_count=len(review_messages),
+                    review_completed=True,
+                    review_success=bool(_writes["writes_performed"]) or bool(actions),
+                    review_iterations_used=_review_iterations if _review_iterations is not None else -1,
+                    writes_performed=_writes["writes_performed"],
+                    writes_blocked=_writes["writes_blocked"],
+                    review_quality_assessment="unassessed",
+                    confidence="low",
+                    reasoning=(
+                        "Placeholder Category B: review quality not assessed at emission time. "
+                        "Analysts: cross-reference writes_performed against later influence reports."
+                    ),
+                    foreground_vs_background={
+                        "entries_background_wrote_that_foreground_missed": [],
+                        "entries_foreground_wrote_that_background_duplicated": [],
+                        "entries_both_missed_suspected": [],
+                    },
+                )
+                emit_report(report, agent.session_id)
+            except Exception as _instr_exc:
+                logger.debug("background_review_complete emit failed: %s", _instr_exc)
 
         if actions:
             summary = " · ".join(dict.fromkeys(actions))
@@ -503,6 +638,34 @@ def _run_review_in_thread(
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
         agent._emit_auxiliary_failure("background review", e)
+        # -- Instrumentation: emit a failure-tagged completion report --
+        if getattr(agent, "_instrumentation_enabled", False):
+            try:
+                from agent.memory_instrumentation import (
+                    emit_report, build_background_review_complete_report,
+                )
+                report = build_background_review_complete_report(
+                    session_id=agent.session_id,
+                    turn_number=getattr(agent, "_user_turn_count", 0),
+                    review_agent_session_id=agent.session_id,
+                    review_messages_count=0,
+                    review_completed=False,
+                    review_success=False,
+                    review_iterations_used=-1,
+                    writes_performed=[],
+                    writes_blocked=[],
+                    review_quality_assessment="unassessed",
+                    confidence="low",
+                    reasoning=f"Background review crashed before completion: {type(e).__name__}",
+                    foreground_vs_background={
+                        "entries_background_wrote_that_foreground_missed": [],
+                        "entries_foreground_wrote_that_background_duplicated": [],
+                        "entries_both_missed_suspected": [],
+                    },
+                )
+                emit_report(report, agent.session_id)
+            except Exception:
+                pass
     finally:
         # Safety-net cleanup for the exception path.  Normal
         # completion already shut down inside redirect_stdout above.

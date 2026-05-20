@@ -296,9 +296,76 @@ def invalidate_system_prompt(agent: Any) -> None:
     Called after context compression events. Also reloads memory from disk
     so the rebuilt prompt captures any writes from this session.
     """
+    # -- Memory instrumentation: snapshot_reload --
+    _instr_enabled = getattr(agent, '_instrumentation_enabled', False)
+    pct_before_str = "0%"
+    entries_before: list = []
+    if _instr_enabled and agent._memory_store:
+        try:
+            from agent.memory_instrumentation import compute_entry_id
+            entries_before = [
+                compute_entry_id(e) for e in list(agent._memory_store.memory_entries)
+            ]
+            limit = agent._memory_store._char_limit("memory")
+            current = agent._memory_store._char_count("memory")
+            pct_before = min(100, int((current / limit) * 100)) if limit > 0 else 0
+            pct_before_str = f"{pct_before}%"
+        except Exception:
+            entries_before = []
+
     agent._cached_system_prompt = None
     if agent._memory_store:
         agent._memory_store.load_from_disk()
+
+    # Flag this turn for the next context_construction report so
+    # compression_active_this_turn can be set truthfully.
+    if _instr_enabled:
+        try:
+            agent._instr_compression_pending = True
+        except Exception:
+            pass
+
+    if _instr_enabled and agent._memory_store:
+        try:
+            from agent.memory_instrumentation import (
+                compute_entry_id, emit_report, build_snapshot_reload_report
+            )
+            entries_after = [compute_entry_id(e) for e in list(agent._memory_store.memory_entries)]
+            entries_added_this_reload = [e for e in entries_after if e not in entries_before]
+            entries_removed_this_reload = [e for e in entries_before if e not in entries_after]
+
+            session_start_ids = getattr(agent, "_instr_session_start_entry_ids", []) or []
+            entries_added_since_start = [e for e in entries_after if e not in session_start_ids]
+            entries_removed_since_start = [e for e in session_start_ids if e not in entries_after]
+
+            limit = agent._memory_store._char_limit("memory")
+            current = agent._memory_store._char_count("memory")
+            pct_after = min(100, int((current / limit) * 100)) if limit > 0 else 0
+
+            report = build_snapshot_reload_report(
+                trigger="context_compression",
+                entries_before=entries_before,
+                entries_after=entries_after,
+                entries_added=entries_added_since_start,
+                entries_removed=entries_removed_since_start,
+                entries_modified=[],
+                usage_pct_before=pct_before_str,
+                usage_pct_after=f"{pct_after}%",
+                compression_count=getattr(getattr(agent, 'context_compressor', None), 'compression_count', 0),
+                session_id=agent.session_id,
+                turn_number=getattr(agent, '_user_turn_count', None),
+                surprise_assessment="unassessed",
+                confidence="low",
+                reasoning=(
+                    "Placeholder Category B: surprise detection not performed live. "
+                    "entries_added/removed_since_session_start computed against agent._instr_session_start_entry_ids."
+                ),
+            )
+            report["category_A_observed"]["entries_added_this_reload"] = entries_added_this_reload
+            report["category_A_observed"]["entries_removed_this_reload"] = entries_removed_this_reload
+            emit_report(report, agent.session_id)
+        except Exception:
+            pass
 
 
 def format_tools_for_system_message(agent: Any) -> str:

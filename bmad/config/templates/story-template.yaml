@@ -1,0 +1,174 @@
+template:
+  id: story-template
+  name: Development Story Template
+  version: 1.0.0
+  description: Complete development story with full context for autonomous implementation
+  output_format: markdown
+  file_extension: .md
+
+workflow:
+  interaction_mode: guided
+  requires_user_input: true
+  auto_save: true
+  validation_rules:
+    - acceptance_criteria_required
+    - technical_context_required
+    - implementation_tasks_required
+
+variables:
+  epic_name: "Feature Epic Name"
+  story_number: "001"
+  story_title: "Brief Story Title"
+  priority: "Medium"
+  estimated_effort: "Medium"
+  assigned_agent: "dev-agent"
+  specialist_domain: "backend"
+
+sections:
+  - id: header
+    title: Story Header
+    template: |
+      ---
+      id: {{epic_name}}-{{story_number}}
+      epic: {{epic_name}}
+      specialist: {{specialist_domain}}
+      status: Draft
+      scope: []
+      depends_on: []
+      ---
+
+      # Story: {{story_title}}
+
+      **Story ID**: {{epic_name}}-{{story_number}}
+      **Epic**: {{epic_name}}
+      **Priority**: {{priority}}
+      **Estimated Effort**: {{estimated_effort}}
+      **Status**: Draft
+      **Assigned to**: {{assigned_agent}}
+      **Created**: {{current_date}}
+
+  - id: user_story
+    title: User Story
+    template: |
+      ## User Story
+
+      **As a** [user type]
+      **I want** [specific goal/capability]
+      **So that** [business value/benefit]
+
+  - id: business_context
+    title: Business Context
+    template: |
+      ## Business Context
+
+      ### Problem Statement
+      [What problem are we solving?]
+
+      ### Business Value
+      [What value does this provide?]
+
+  - id: acceptance_criteria
+    title: Acceptance Criteria
+    template: |
+      ## Acceptance Criteria
+
+      **AC1:** [Primary happy path]
+      - **Given** [initial condition]
+      - **When** [action]
+      - **Then** [expected result]
+
+      **AC2:** [Error/edge case]
+      - **Given** [condition]
+      - **When** [action]
+      - **Then** [expected result]
+
+  - id: technical_context
+    title: Technical Context
+    template: |
+      ## Technical Context
+
+      ### Architecture Reference
+      [Relevant section from ARCHITECTURE.md]
+
+      ### Existing Patterns to Follow
+      [Reference existing code patterns in the codebase]
+
+      ### Dependencies
+      [Other stories or components required]
+
+  - id: implementation_guidance
+    title: Implementation Guidance
+    template: |
+      ## Implementation Guidance
+
+      ### Files to Modify/Create
+      - `[file]` - [description of changes]
+      - `tests/test_[file]` - [what to test]
+
+      ### Key Functions/Interfaces
+      ```
+      function_name(param: type) -> return_type
+        """Description."""
+      ```
+
+  - id: runtime_validation
+    title: Runtime Validation
+    optional: true
+    template: |
+      ## Runtime Validation (optional — for user-facing stories)
+      <!-- Uncomment and configure to enable runtime checks during /implement Phase 6.75 -->
+      <!-- The agent will launch the app, run these checks, and verify expected output -->
+      ```yaml
+      # runtime_validation:
+      #   launch_command: "{{APP_LAUNCH_COMMAND}}"
+      #   acceptance_checks:
+      #     - description: "Health endpoint returns 200"
+      #       command: "curl -s -o /dev/null -w '%{http_code}' http://localhost:{{PORT}}/health"
+      #       expected: "200"
+      ```
+
+  - id: testing_requirements
+    title: Testing Requirements
+    template: |
+      ## Testing Requirements
+
+      ### Unit Tests
+      - Test [specific functionality]
+      - Test edge cases: [specific cases]
+
+      ### Test Patterns
+      ```
+      def test_example(sample_fixture):
+          result = function_under_test(sample_fixture)
+          assert result == expected
+      ```
+
+  - id: definition_of_done
+    title: Definition of Done
+    template: |
+      ## Definition of Done
+
+      - [ ] Type hints on all functions
+      - [ ] Docstrings on public functions
+      - [ ] Lint check passes
+      - [ ] Tests written and passing
+      - [ ] Acceptance criteria verified
+      - [ ] Story status updated
+
+  - id: notes_section
+    title: Development Notes
+    template: |
+      ## Development Notes
+
+      ### Dev Agent Notes
+      [Implementation notes and decisions]
+
+      ### QA Agent Notes
+      [Testing notes and validation results]
+
+validation_checklist:
+  - "Story has clear user value"
+  - "Acceptance criteria are testable (Given-When-Then)"
+  - "Technical context references ARCHITECTURE.md"
+  - "Implementation guidance includes real file paths"
+  - "Testing requirements cover edge cases"

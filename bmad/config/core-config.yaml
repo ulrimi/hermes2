@@ -1,0 +1,51 @@
+project:
+  name: "hermes2"
+  description: "hermes2"
+  language: "python"
+  version: "1.0.0"
+
+bmad:
+  version: "1.0.0"
+  epic_dir: "bmad/epics"
+  workflow_dir: "bmad/config/workflows"
+  agent_dir: "bmad/config/agents/active"
+
+commands:
+  test: "pytest"
+  lint: "ruff check ."
+  format_check: "ruff format --check ."
+  app_launch: "python main.py  # or: streamlit run app.py / uvicorn app:app"
+  env_activate: "source venv/bin/activate"
+
+structural_validation:
+  enabled: false  # Set true when validation scripts exist
+  checks:
+    # Uncomment and configure checks for your project:
+    # - name: "Dependency Direction"
+    #   command: "python lints/check_dependencies.py"
+    # - name: "File Size Limits"
+    #   command: "python lints/check_file_sizes.py --max 300"
+    # - name: "Naming Conventions"
+    #   command: "python lints/check_naming.py"
+    # - name: "Boundary Validation"
+    #   command: "python lints/check_boundaries.py"
+
+quality_gates:
+  pre_work:
+    - env_active
+    - app_launches
+    - tests_pass
+    - lint_clean
+  post_work:
+    - tests_pass
+    - lint_clean
+    - format_clean
+    - app_launches
+    - story_updated
+
+specialists:
+  - backend
+  - frontend
+  - data
+  - qa
+  - infra

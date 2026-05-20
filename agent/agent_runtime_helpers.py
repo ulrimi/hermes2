@@ -1515,6 +1515,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             content=function_args.get("content"),
             old_text=function_args.get("old_text"),
             store=agent._memory_store,
+            instrumentation_session_id=getattr(agent, '_instrumentation_session_id', None) or agent.session_id,
+            instrumentation_source=getattr(agent, '_instrumentation_source', 'foreground'),
+            instrumentation_turn_number=getattr(agent, '_user_turn_count', None),
+            write_category=function_args.get("write_category"),
+            predicted_utility_horizon=function_args.get("predicted_utility_horizon"),
+            storage_confidence=function_args.get("storage_confidence"),
+            classification_reasoning=function_args.get("classification_reasoning"),
         )
         # Bridge: notify external memory provider of built-in memory writes
         if agent._memory_manager and function_args.get("action") in {"add", "replace"}:

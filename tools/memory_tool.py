@@ -35,6 +35,19 @@ from typing import Dict, Any, List, Optional
 
 from utils import atomic_replace
 
+try:
+    from agent.memory_instrumentation import (
+        compute_entry_id,
+        emit_report,
+        build_memory_write_report,
+        build_memory_write_blocked_report,
+    )
+except ImportError:
+    compute_entry_id = None  # type: ignore
+    emit_report = None  # type: ignore
+    build_memory_write_report = None  # type: ignore
+    build_memory_write_blocked_report = None  # type: ignore
+
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 msvcrt = None
 try:
@@ -89,19 +102,24 @@ _INVISIBLE_CHARS = {
 }
 
 
-def _scan_memory_content(content: str) -> Optional[str]:
-    """Scan memory content for injection/exfil patterns. Returns error string if blocked."""
+def _scan_memory_content(content: str):
+    """Scan memory content for injection/exfil patterns.
+
+    Returns (error_string, pattern_id) if blocked, or (None, None) if clean.
+    pattern_id is the short identifier from _MEMORY_THREAT_PATTERNS (e.g. 'prompt_injection')
+    or 'invisible_unicode' for invisible character blocks.
+    """
     # Check invisible unicode
     for char in _INVISIBLE_CHARS:
         if char in content:
-            return f"Blocked: content contains invisible unicode character U+{ord(char):04X} (possible injection)."
+            return (f"Blocked: content contains invisible unicode character U+{ord(char):04X} (possible injection).", "invisible_unicode")
 
     # Check threat patterns
     for pattern, pid in _MEMORY_THREAT_PATTERNS:
         if re.search(pattern, content, re.IGNORECASE):
-            return f"Blocked: content matches threat pattern '{pid}'. Memory entries are injected into the system prompt and must not contain injection or exfiltration payloads."
+            return (f"Blocked: content matches threat pattern '{pid}'. Memory entries are injected into the system prompt and must not contain injection or exfiltration payloads.", pid)
 
-    return None
+    return (None, None)
 
 
 class MemoryStore:
@@ -225,9 +243,9 @@ class MemoryStore:
             return {"success": False, "error": "Content cannot be empty."}
 
         # Scan for injection/exfiltration before accepting
-        scan_error = _scan_memory_content(content)
+        scan_error, scan_pattern = _scan_memory_content(content)
         if scan_error:
-            return {"success": False, "error": scan_error}
+            return {"success": False, "error": scan_error, "_blocked_pattern": scan_pattern}
 
         with self._file_lock(self._path_for(target)):
             # Re-read from disk under lock to pick up writes from other sessions
@@ -273,9 +291,9 @@ class MemoryStore:
             return {"success": False, "error": "new_content cannot be empty. Use 'remove' to delete entries."}
 
         # Scan replacement content for injection/exfiltration
-        scan_error = _scan_memory_content(new_content)
+        scan_error, scan_pattern = _scan_memory_content(new_content)
         if scan_error:
-            return {"success": False, "error": scan_error}
+            return {"success": False, "error": scan_error, "_blocked_pattern": scan_pattern}
 
         with self._file_lock(self._path_for(target)):
             self._reload_target(target)
@@ -315,11 +333,14 @@ class MemoryStore:
                     ),
                 }
 
+            previous_entry = entries[idx]
             entries[idx] = new_content
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry replaced.")
+        resp = self._success_response(target, "Entry replaced.")
+        resp["_previous_content"] = previous_entry
+        return resp
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
@@ -349,11 +370,13 @@ class MemoryStore:
                 # All identical -- safe to remove just the first
 
             idx = matches[0][0]
-            entries.pop(idx)
+            removed_entry = entries.pop(idx)
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry removed.")
+        resp = self._success_response(target, "Entry removed.")
+        resp["_previous_content"] = removed_entry
+        return resp
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
@@ -465,6 +488,14 @@ def memory_tool(
     content: str = None,
     old_text: str = None,
     store: Optional[MemoryStore] = None,
+    instrumentation_session_id: str = None,
+    instrumentation_source: str = "foreground",
+    instrumentation_turn_number: int = None,
+    # Agent-supplied classification fields (turn placeholder Category B into reasoning_trace)
+    write_category: str = None,
+    predicted_utility_horizon: str = None,
+    storage_confidence: str = None,
+    classification_reasoning: str = None,
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
@@ -496,6 +527,102 @@ def memory_tool(
 
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+
+    # -- Instrumentation: emit write or blocked report --
+    if instrumentation_session_id and emit_report:
+        try:
+            if result.get("success"):
+                previous_content = result.get("_previous_content")
+                if action == "remove":
+                    written_content = previous_content or ""
+                    entry_id = compute_entry_id(written_content) if written_content else "sha256:unknown"
+                    previous_entry_id = entry_id
+                else:
+                    written_content = content or ""
+                    entry_id = compute_entry_id(written_content) if written_content else "sha256:unknown"
+                    previous_entry_id = (
+                        compute_entry_id(previous_content) if action == "replace" and previous_content else None
+                    )
+                entries_after = result.get("entry_count", len(result.get("entries", [])))
+
+                # Category B: agent-supplied classification → reasoning_trace; else placeholder
+                agent_classified = any(
+                    v is not None and v != ""
+                    for v in (write_category, predicted_utility_horizon,
+                              storage_confidence, classification_reasoning)
+                )
+                if agent_classified:
+                    _cat_b = {
+                        "write_category": write_category or "unassessed",
+                        "predicted_utility_horizon": predicted_utility_horizon or "unassessed",
+                        "storage_confidence": storage_confidence or "medium",
+                        "method": "reasoning_trace",
+                        "reasoning": (
+                            classification_reasoning
+                            or "Agent supplied classification labels but no free-text reasoning."
+                        ),
+                    }
+                else:
+                    _cat_b = {
+                        "write_category": "unassessed",
+                        "predicted_utility_horizon": "unassessed",
+                        "storage_confidence": "low",
+                        "method": "pattern_matching",
+                        "reasoning": (
+                            "Placeholder Category B: agent did not supply classification. "
+                            "Analysts: filter on method=='pattern_matching' to exclude these."
+                        ),
+                    }
+
+                report = build_memory_write_report(
+                    action=action,
+                    target=target,
+                    content=written_content,
+                    entry_id=entry_id,
+                    content_length_chars=len(written_content),
+                    previous_entry_id=previous_entry_id,
+                    previous_content=previous_content if action in ("replace", "remove") else None,
+                    result="success",
+                    entries_after_count=entries_after,
+                    usage_after=result.get("usage", ""),
+                    source=instrumentation_source,
+                    session_id=instrumentation_session_id,
+                    turn_number=instrumentation_turn_number,
+                    write_category=_cat_b["write_category"],
+                    predicted_utility_horizon=_cat_b["predicted_utility_horizon"],
+                    storage_confidence=_cat_b["storage_confidence"],
+                    reasoning_method=_cat_b["method"],
+                    reasoning=_cat_b["reasoning"],
+                )
+                emit_report(report, instrumentation_session_id)
+
+            elif result.get("_blocked_pattern"):
+                report = build_memory_write_blocked_report(
+                    action=action,
+                    target=target,
+                    block_reason=result.get("error", "Unknown block reason"),
+                    block_pattern_matched=result.get("_blocked_pattern"),
+                    content_attempted_first_80_chars=(content or "")[:80] + ("..." if len(content or "") > 80 else ""),
+                    source=instrumentation_source,
+                    session_id=instrumentation_session_id,
+                    turn_number=instrumentation_turn_number,
+                    legitimacy="uncertain",
+                    confidence="low",
+                    reasoning_method="pattern_matching",
+                    reasoning=(
+                        "Placeholder Category B: scanner blocked content; legitimacy enum not assessed. "
+                        "Analysts must classify legitimately/maliciously blocked content externally."
+                    ),
+                )
+                emit_report(report, instrumentation_session_id)
+
+        except Exception:
+            pass  # Instrumentation is best-effort
+
+    # Strip internal-only keys before serializing to the model
+    if isinstance(result, dict):
+        for _k in [k for k in result if isinstance(k, str) and k.startswith("_")]:
+            result.pop(_k, None)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -532,7 +659,22 @@ MEMORY_SCHEMA = {
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
         "remove (delete -- old_text identifies it).\n\n"
-        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
+        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state.\n\n"
+        "CLASSIFY EVERY WRITE (research instrumentation -- helps the operator analyze which "
+        "writes actually paid off). On every add and replace, also supply:\n"
+        "- write_category: one short snake_case label describing the kind of fact "
+        "(e.g. user_preference, project_convention, environment_discovery, behavioral_correction, "
+        "session_summary, domain_knowledge). Pick the most specific label that fits.\n"
+        "- predicted_utility_horizon: how far ahead you expect this to matter. "
+        "Use 'transient' (this turn only -- probably shouldn't be writing it), "
+        "'this_session' (rest of current session), 'next_session' (across session boundary), "
+        "or 'indefinite' (stable fact, useful for the foreseeable future).\n"
+        "- storage_confidence: 'high' (clearly worth keeping), 'medium' (probably useful, "
+        "low cost to retain), 'low' (uncertain -- justify why you're storing anyway).\n"
+        "- classification_reasoning: ONE sentence (max ~25 words) explaining your category/"
+        "horizon/confidence choices -- the actual reasoning, not a restatement of the label.\n"
+        "These four fields are optional for backward compatibility, but please fill them on "
+        "every write. They're how the operator measures whether your storage decisions are good."
     ),
     "parameters": {
         "type": "object",
@@ -555,6 +697,38 @@ MEMORY_SCHEMA = {
                 "type": "string",
                 "description": "Short unique substring identifying the entry to replace or remove."
             },
+            "write_category": {
+                "type": "string",
+                "description": (
+                    "Short snake_case label for the kind of fact being stored. "
+                    "Examples: user_preference, project_convention, environment_discovery, "
+                    "behavioral_correction, session_summary, domain_knowledge. "
+                    "Strongly encouraged on add/replace; optional for remove."
+                ),
+            },
+            "predicted_utility_horizon": {
+                "type": "string",
+                "enum": ["transient", "this_session", "next_session", "indefinite"],
+                "description": (
+                    "How far ahead you expect this entry to remain useful. "
+                    "Strongly encouraged on add/replace; optional for remove."
+                ),
+            },
+            "storage_confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"],
+                "description": (
+                    "Your confidence that this is worth storing. "
+                    "Strongly encouraged on add/replace; optional for remove."
+                ),
+            },
+            "classification_reasoning": {
+                "type": "string",
+                "description": (
+                    "One short sentence (~25 words) explaining the category/horizon/confidence "
+                    "choices. The actual reasoning, not a restatement of the labels."
+                ),
+            },
         },
         "required": ["action", "target"],
     },
@@ -573,7 +747,11 @@ registry.register(
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
-        store=kw.get("store")),
+        store=kw.get("store"),
+        write_category=args.get("write_category"),
+        predicted_utility_horizon=args.get("predicted_utility_horizon"),
+        storage_confidence=args.get("storage_confidence"),
+        classification_reasoning=args.get("classification_reasoning")),
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
